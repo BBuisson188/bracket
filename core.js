@@ -88,6 +88,71 @@
     return formats;
   }
 
+  function formatScore(roundFormats) {
+    return Object.values(roundFormats).reduce((sum, points) => sum + Number(points || 11), 0);
+  }
+
+  function upgradeRoundFormats(totalRounds, targetScore) {
+    const formats = {};
+    for (let r = 1; r <= totalRounds; r += 1) formats[r] = 11;
+
+    const upgradeOrder = [];
+    for (let r = totalRounds; r >= 1; r -= 1) upgradeOrder.push({ round: r, points: 21 });
+    for (let r = totalRounds; r >= 1; r -= 1) upgradeOrder.push({ round: r, points: 15 });
+
+    let currentScore = formatScore(formats);
+    upgradeOrder.forEach(({ round, points }) => {
+      if (formats[round] >= points) return;
+      const nextScore = currentScore + (points - formats[round]);
+      if (nextScore <= targetScore) {
+        formats[round] = points;
+        currentScore = nextScore;
+      }
+    });
+    return formats;
+  }
+
+  function generateFormatCandidates(totalRounds) {
+    const candidates = [];
+    const pointChoices = [11, 15, 21];
+
+    function build(round, formats) {
+      if (round > totalRounds) {
+        candidates.push({ ...formats });
+        return;
+      }
+      pointChoices.forEach((points) => {
+        if (round > 1 && points < formats[round - 1]) return;
+        if (round === totalRounds && points < 21) return;
+        if (round === totalRounds - 1 && points < 15) return;
+        formats[round] = points;
+        build(round + 1, formats);
+      });
+    }
+
+    build(1, {});
+    return candidates.sort((a, b) => formatScore(a) - formatScore(b));
+  }
+
+  function chooseSmartFormats(playerCount, tableCount, totalRounds, settings, targetMinutes, maxMinutes) {
+    const candidates = generateFormatCandidates(totalRounds);
+    let best = candidates[0];
+    let bestDistance = Infinity;
+    candidates.forEach((formats) => {
+      const estimate = estimateOption(playerCount, tableCount, formats, settings);
+      if (estimate.realisticMinutes <= maxMinutes) {
+        const distance = Math.abs(targetMinutes - estimate.realisticMinutes);
+        if (distance < bestDistance || (distance === bestDistance && formatScore(formats) > formatScore(best))) {
+          bestDistance = distance;
+          best = formats;
+        }
+      } else if (bestDistance === Infinity && estimate.realisticMinutes < estimateOption(playerCount, tableCount, best, settings).realisticMinutes) {
+        best = formats;
+      }
+    });
+    return best;
+  }
+
   function gameMinutesForPoints(points, settings = {}) {
     const durations = settings.gameDurations || {};
     if (points === 11) return Number(durations[11] ?? 7);
@@ -169,24 +234,31 @@
     const tableCount = Number(settings.tables || 2);
     const size = nextPowerOfTwo(playerCount);
     const totalRounds = Math.log2(size);
+    const available = totalEffectiveMinutes(settings);
+    const fastMax = Math.min(180, available * 0.9);
+    const balancedMax = Math.min(190, available * 0.95);
+    const relaxedMax = available;
+    const fastFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, fastMax, fastMax);
+    const balancedFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, Math.min(185, balancedMax), balancedMax);
+    const relaxedFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, available, relaxedMax);
     const rawOptions = [
       {
         id: 'fast',
         name: 'Fast / Safest',
-        description: 'Best choice when finishing early matters most. Most games stay short; semifinals and final still feel bigger.',
-        formats: defaultRoundFormats(totalRounds, 'fast'),
+        description: 'Protects the schedule first. Uses the longest game formats that still leave a large time cushion.',
+        formats: fastFormats,
       },
       {
         id: 'balanced',
         name: 'Balanced',
-        description: 'A little more breathing room for later rounds while keeping the early rounds moving.',
-        formats: defaultRoundFormats(totalRounds, 'balanced'),
+        description: 'Middle option. Adds longer games when the player count, tables, and session windows make room.',
+        formats: balancedFormats,
       },
       {
         id: 'relaxed',
         name: 'Relaxed',
-        description: 'More longer games. Use only if player count is low, table count is good, or you are well ahead of schedule.',
-        formats: defaultRoundFormats(totalRounds, 'relaxed'),
+        description: 'Most generous safe option. Can become all 21-point games when the schedule clearly allows it.',
+        formats: relaxedFormats,
       },
     ];
 
@@ -199,9 +271,9 @@
     let recommendedId = 'fast';
     const relaxed = estimated.find((o) => o.id === 'relaxed');
     const balanced = estimated.find((o) => o.id === 'balanced');
-    if (relaxed && relaxed.estimate.pressure === 'comfortable' && relaxed.estimate.realisticMinutes <= relaxed.estimate.availableMinutes * 0.7) {
+    if (relaxed && relaxed.estimate.pressure !== 'risky' && relaxed.estimate.realisticMinutes <= relaxed.estimate.availableMinutes * 0.82) {
       recommendedId = 'relaxed';
-    } else if (balanced && balanced.estimate.pressure !== 'risky' && balanced.estimate.realisticMinutes <= balanced.estimate.availableMinutes * 0.8) {
+    } else if (balanced && balanced.estimate.pressure !== 'risky' && balanced.estimate.realisticMinutes <= balanced.estimate.availableMinutes * 0.72) {
       recommendedId = 'balanced';
     }
 

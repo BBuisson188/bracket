@@ -188,7 +188,8 @@ function tournamentEstimateMap() {
   const tables = state.tables?.length ? state.tables : [{ id: 1, label: 'Table 1' }];
   const settings = state.settings || {};
   const windows = C.sessionWindows(settings);
-  const tableAvailable = new Map(tables.map((t) => [t.id, currentNow]));
+  const scheduleBase = scheduleBaseMs(settings, currentNow);
+  const tableAvailable = new Map(tables.map((t) => [t.id, scheduleBase]));
   const estimates = new Map();
 
   activeMatches().forEach((match) => {
@@ -225,34 +226,36 @@ function tournamentEstimateMap() {
     })
     .forEach((match) => {
       const dependencyTimes = [match.slotA, match.slotB].map((slot) => {
-        if (slot.kind !== 'winner') return currentNow;
+        if (slot.kind !== 'winner') return scheduleBase;
         const source = getMatch(slot.sourceMatchId);
-        if (!source) return currentNow;
-        if (source.status === 'complete') return source.completedAt || currentNow;
-        return estimates.get(source.id)?.estimatedEndMs || currentNow;
+        if (!source) return scheduleBase;
+        if (source.status === 'complete') return Math.max(scheduleBase, source.completedAt || scheduleBase);
+        return estimates.get(source.id)?.estimatedEndMs || scheduleBase;
       });
-      let earliest = Math.max(currentNow, ...dependencyTimes);
+      let earliest = Math.max(scheduleBase, ...dependencyTimes);
       if (match.holdUntilSession) {
         const heldSession = windows.find((w) => w.id === match.holdUntilSession);
         if (heldSession?.startMs) earliest = Math.max(earliest, heldSession.startMs);
       }
 
       let sortedTables = [...tableAvailable.entries()].sort((a, b) => a[1] - b[1]);
-      let [tableId, availableAt] = sortedTables[0] || [1, currentNow];
+      let [tableId, availableAt] = sortedTables[0] || [1, scheduleBase];
       let start = Math.max(earliest, availableAt);
+      const durationMs = C.occupancyMinutesForMatch(match, settings) * C.MINUTE;
+      start = fitStartIntoSession(start, durationMs, settings);
       let startCheck = C.canStartMatch(match, start, settings);
-      if (startCheck.level === 'unsafe' && startCheck.nextSession?.startMs) {
+      if (startCheck.level !== 'safe' && startCheck.nextSession?.startMs) {
         start = Math.max(startCheck.nextSession.startMs, earliest);
         sortedTables = [...tableAvailable.entries()].sort((a, b) => {
           const at = Math.max(a[1], start);
           const bt = Math.max(b[1], start);
           return at - bt;
         });
-        [tableId, availableAt] = sortedTables[0] || [1, start];
+        [tableId, availableAt] = sortedTables[0] || [1, scheduleBase];
         start = Math.max(start, availableAt);
+        start = fitStartIntoSession(start, durationMs, settings);
         startCheck = C.canStartMatch(match, start, settings);
       }
-      const durationMs = C.occupancyMinutesForMatch(match, settings) * C.MINUTE;
       estimates.set(match.id, {
         matchId: match.id,
         tableId,
@@ -264,6 +267,39 @@ function tournamentEstimateMap() {
     });
 
   return estimates;
+}
+
+function scheduleBaseMs(settings, currentNow) {
+  const windows = C.sessionWindows(settings).filter((w) => w.startMs != null && w.endMs != null);
+  if (!windows.length) return currentNow;
+  const active = windows.find((w) => currentNow >= w.startMs && currentNow <= (w.softEndMs || w.endMs));
+  if (active) return currentNow;
+  const upcoming = windows.find((w) => currentNow < w.startMs);
+  if (upcoming) return upcoming.startMs;
+  const laterToday = windows.find((w) => currentNow <= w.endMs);
+  if (laterToday?.softEndMs && currentNow > laterToday.softEndMs) {
+    const next = windows.find((w) => w.startMs > currentNow);
+    if (next) return next.startMs;
+  }
+  return windows[windows.length - 1].startMs || currentNow;
+}
+
+function fitStartIntoSession(startMs, durationMs, settings) {
+  const windows = C.sessionWindows(settings).filter((w) => w.startMs != null && w.endMs != null);
+  if (!windows.length) return startMs;
+  for (const window of windows) {
+    if (startMs < window.startMs) {
+      const projectedFromStart = window.startMs + durationMs;
+      if (!window.softEndMs || projectedFromStart <= window.softEndMs) return window.startMs;
+      continue;
+    }
+    if (startMs <= window.endMs) {
+      const projected = startMs + durationMs;
+      if (!window.softEndMs || projected <= window.softEndMs) return startMs;
+      continue;
+    }
+  }
+  return startMs;
 }
 
 function recommendedWarmupMinutes() {
@@ -1082,7 +1118,7 @@ function matchPaceInfo(match) {
 
 function renderReadyMatch(m, onDeck) {
   const est = estimatedForMatch(m.id);
-  const safety = C.canStartMatch(m, nowMs(), state.settings, recommendedWarmupMinutes());
+  const safety = C.canStartMatch(m, est?.estimatedStartMs || nowMs(), state.settings, recommendedWarmupMinutes());
   const safetyClass = safety.level === 'safe' ? 'good' : safety.level === 'tight' ? 'warn' : safety.level === 'unsafe' ? 'bad' : 'muted';
   return `
     <div class="match-card ${safety.level === 'unsafe' ? 'warning' : ''}">

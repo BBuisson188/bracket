@@ -26,6 +26,12 @@ for (let n = 2; n <= 32; n += 1) {
   const players = makePlayers(n);
   const options = C.generateTournamentOptions(players, settings);
   assert(options.length === 3, `Expected 3 options for ${n}`);
+  options.forEach((option) => {
+    const rounds = Object.keys(option.formats).map(Number).sort((a, b) => a - b);
+    rounds.forEach((round, idx) => {
+      if (idx > 0) assert(option.formats[round] >= option.formats[rounds[idx - 1]], `Formats should not get shorter in later rounds for ${n} players.`);
+    });
+  });
   const bracket = C.buildBracket(players, options[0]);
   const playableMatches = bracket.filter((m) => !m.isBye);
   const completedByes = bracket.filter((m) => m.isBye);
@@ -43,6 +49,17 @@ const bracket10 = C.buildBracket(players10, option10);
 assert(bracket10.some((m) => m.isBye && m.winnerId === 'p1'), 'Seed #1 should receive a bye with 10 players.');
 assert(bracket10.some((m) => m.playerAId === 'p8' && m.playerBId === 'p9'), '10-player bracket should pair seed 8 vs seed 9.');
 
+const roomySettings = {
+  ...settings,
+  tables: 4,
+  sessions: [
+    { id: 'friday', label: 'Friday', date: '2026-06-05', startTime: '13:00', endTime: '17:00' },
+    { id: 'saturday', label: 'Saturday', date: '2026-06-06', startTime: '13:00', endTime: '17:00' },
+  ],
+};
+const roomyOptions = C.generateTournamentOptions(makePlayers(19), roomySettings);
+const roomyRelaxed = roomyOptions.find((o) => o.id === 'relaxed');
+assert(Object.values(roomyRelaxed.formats).every((points) => points === 21), 'Roomy 19-player relaxed option should allow all 21-point rounds.');
 
 for (let n = 2; n <= 32; n += 1) {
   const players = makePlayers(n);
@@ -61,4 +78,3 @@ for (let n = 2; n <= 32; n += 1) {
 }
 
 console.log('Core smoke tests passed.');
-
