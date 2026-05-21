@@ -36,6 +36,9 @@ function defaultState() {
     tables: [],
     currentSessionId: 'friday',
     lastMessage: '',
+    ui: {
+      collapsedRounds: {},
+    },
     settings: {
       tables: 2,
       sessions: [
@@ -56,10 +59,15 @@ function defaultState() {
       lastRealTickMs: Date.now(),
     },
     sync: {
+      projectId: 'beau-games',
+      tournamentName: 'Ping-Pong Retreat',
+      tournamentId: 'ping-pong-retreat',
+      availableTournaments: [],
       databaseUrl: '',
       tournamentKey: `retreat-${Math.random().toString(36).slice(2, 8)}`,
       lastPushedAt: null,
       lastPulledAt: null,
+      lastListedAt: null,
       lastError: '',
     },
     history: [],
@@ -89,6 +97,8 @@ function mergeDefaults(base, saved) {
   out.settings.gameDurations = { ...base.settings.gameDurations, ...(saved.settings?.gameDurations || {}) };
   out.clock = { ...base.clock, ...(saved.clock || {}) };
   out.sync = { ...base.sync, ...(saved.sync || {}) };
+  out.ui = { ...base.ui, ...(saved.ui || {}) };
+  out.ui.collapsedRounds = { ...base.ui.collapsedRounds, ...(saved.ui?.collapsedRounds || {}) };
   return out;
 }
 
@@ -128,6 +138,7 @@ function tickClock() {
   state.clock.lastRealTickMs = realNow;
   updateHeader();
   updateVisibleTimers();
+  updateVisiblePace();
 }
 
 function setTab(tab) {
@@ -165,14 +176,14 @@ function selectedOption() {
 }
 
 function schedule() {
-  return C.buildEstimatedSchedule(state, nowMs());
+  return [...tournamentEstimateMap().values()];
 }
 
 function estimatedForMatch(matchId) {
-  return schedule().find((s) => s.matchId === matchId) || null;
+  return tournamentEstimateMap().get(matchId) || null;
 }
 
-function bracketSchedule() {
+function tournamentEstimateMap() {
   const currentNow = nowMs();
   const tables = state.tables?.length ? state.tables : [{ id: 1, label: 'Table 1' }];
   const settings = state.settings || {};
@@ -510,6 +521,46 @@ function addFakePlayers(count) {
   commit(`Loaded ${count} sample players.`);
 }
 
+function tournamentIdFromName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'ping-pong-retreat';
+}
+
+function firestoreBaseUrl() {
+  const projectId = state.sync.projectId || 'beau-games';
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents`;
+}
+
+function firestoreTournamentUrl(id = state.sync.tournamentId) {
+  return `${firestoreBaseUrl()}/tournaments/${encodeURIComponent(id)}`;
+}
+
+function firestoreTournamentFields(name, snapshotState) {
+  return {
+    fields: {
+      name: { stringValue: name },
+      updatedAt: { timestampValue: new Date().toISOString() },
+      state: { stringValue: JSON.stringify(snapshotState) },
+    },
+  };
+}
+
+function readFirestoreStringField(doc, field) {
+  return doc?.fields?.[field]?.stringValue || '';
+}
+
+function readFirestoreTimestampField(doc, field) {
+  return doc?.fields?.[field]?.timestampValue || '';
+}
+
+function firestoreDocId(doc) {
+  return String(doc?.name || '').split('/').pop() || '';
+}
+
 function testCompleteNextActive() {
   const active = activeMatches()[0];
   if (!active) {
@@ -523,53 +574,89 @@ function testCompleteNextActive() {
 }
 
 async function pushSnapshot() {
-  if (!state.sync.databaseUrl || !state.sync.tournamentKey) {
-    alert('Enter a Firebase Realtime Database URL and tournament key first.');
+  const name = String(state.sync.tournamentName || '').trim();
+  if (!name) {
+    alert('Enter a tournament name on Setup first.');
     return;
   }
+  state.sync.tournamentId = tournamentIdFromName(name);
   try {
     const payload = exportSnapshotObject();
-    const url = firebaseUrl();
-    const res = await fetch(url, {
-      method: 'PUT',
+    const res = await fetch(firestoreTournamentUrl(), {
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(firestoreTournamentFields(name, payload.state)),
     });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     state.sync.lastPushedAt = Date.now();
     state.sync.lastError = '';
-    commit('Snapshot pushed to Firebase.');
+    commit('Tournament snapshot pushed to Firestore.');
   } catch (err) {
     state.sync.lastError = String(err.message || err);
-    commit('Firebase push failed.');
+    commit('Firestore push failed.');
   }
 }
 
 async function pullSnapshot() {
-  if (!state.sync.databaseUrl || !state.sync.tournamentKey) {
-    alert('Enter a Firebase Realtime Database URL and tournament key first.');
+  if (!state.sync.tournamentId) {
+    alert('Choose or enter a tournament first.');
     return;
   }
   try {
-    const res = await fetch(firebaseUrl());
+    const res = await fetch(firestoreTournamentUrl());
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    const payload = await res.json();
-    if (!payload || !payload.state) throw new Error('No snapshot found at that key.');
+    const doc = await res.json();
+    const rawState = readFirestoreStringField(doc, 'state');
+    if (!rawState) throw new Error('No snapshot state found for that tournament.');
+    const pulledState = JSON.parse(rawState);
     const keepSync = { ...state.sync };
-    state = mergeDefaults(defaultState(), payload.state);
+    state = mergeDefaults(defaultState(), pulledState);
     state.sync = { ...state.sync, ...keepSync, lastPulledAt: Date.now(), lastError: '' };
     if (state.role === 'viewer') state.activeTab = 'overview';
-    commit('Snapshot refreshed from Firebase.');
+    commit('Tournament snapshot retrieved from Firestore.');
   } catch (err) {
     state.sync.lastError = String(err.message || err);
-    commit('Firebase refresh failed.');
+    commit('Firestore retrieve failed.');
   }
 }
 
-function firebaseUrl() {
-  const base = state.sync.databaseUrl.replace(/\/$/, '');
-  const key = encodeURIComponent(state.sync.tournamentKey);
-  return `${base}/tournaments/${key}.json`;
+async function listFirestoreTournaments() {
+  try {
+    const res = await fetch(`${firestoreBaseUrl()}/tournaments?pageSize=100`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const payload = await res.json();
+    state.sync.availableTournaments = (payload.documents || [])
+      .map((doc) => ({
+        id: firestoreDocId(doc),
+        name: readFirestoreStringField(doc, 'name') || firestoreDocId(doc),
+        updatedAt: readFirestoreTimestampField(doc, 'updatedAt'),
+      }))
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    state.sync.lastListedAt = Date.now();
+    state.sync.lastError = '';
+    commit('Tournament list refreshed.');
+  } catch (err) {
+    state.sync.lastError = String(err.message || err);
+    commit('Tournament list refresh failed.');
+  }
+}
+
+async function deleteFirestoreTournament() {
+  if (!state.sync.tournamentId) {
+    alert('Choose or enter a tournament first.');
+    return;
+  }
+  if (!confirm(`Delete tournament "${state.sync.tournamentName || state.sync.tournamentId}" from Firestore? Local data on this device will stay.`)) return;
+  try {
+    const res = await fetch(firestoreTournamentUrl(), { method: 'DELETE' });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    state.sync.availableTournaments = (state.sync.availableTournaments || []).filter((t) => t.id !== state.sync.tournamentId);
+    state.sync.lastError = '';
+    commit('Tournament deleted from Firestore.');
+  } catch (err) {
+    state.sync.lastError = String(err.message || err);
+    commit('Firestore delete failed. Your Firestore rules may still have delete disabled.');
+  }
 }
 
 function exportSnapshotObject() {
@@ -629,7 +716,7 @@ function updateHeader() {
   modeParts.push(state.role === 'viewer' ? 'Viewer' : state.mode === 'running' ? 'Running' : 'Setup');
   modeBadge.textContent = modeParts.join(' • ');
   modeBadge.className = `badge ${state.settings.testMode ? 'warn' : state.mode === 'running' ? 'good' : ''}`;
-  clockBadge.textContent = C.formatClock(nowMs());
+  clockBadge.textContent = state.settings.testMode ? `Test ${C.formatClock(nowMs())}` : `Now ${C.formatClock(Date.now())}`;
   subtitle.textContent = state.lastMessage || 'Offline-first tournament control board';
 }
 
@@ -657,10 +744,13 @@ function bindEvents() {
       if (action === 'delay') delayMatch(id);
       if (action === 'tomorrow') delayUntilTomorrow(id);
       if (action === 'undo') undoLastResult();
+      if (action === 'toggle-round') toggleBracketRound(Number(el.dataset.round));
       if (action === 'jump-clock') jumpTestClock(el.dataset.target);
       if (action === 'test-complete-next') testCompleteNextActive();
       if (action === 'push') await pushSnapshot();
       if (action === 'pull') await pullSnapshot();
+      if (action === 'list-tournaments') await listFirestoreTournaments();
+      if (action === 'delete-tournament') await deleteFirestoreTournament();
       if (action === 'download-snapshot') downloadSnapshot();
     };
   });
@@ -668,6 +758,18 @@ function bindEvents() {
   document.querySelectorAll('[data-input]').forEach((el) => {
     const updateInput = () => {
       if (el.dataset.input === 'role') state.role = el.value;
+      if (el.dataset.input === 'tournament-name') {
+        state.sync.tournamentName = el.value.trim();
+        state.sync.tournamentId = tournamentIdFromName(state.sync.tournamentName);
+      }
+      if (el.dataset.input === 'tournament-select') {
+        const selected = (state.sync.availableTournaments || []).find((t) => t.id === el.value);
+        if (selected) {
+          state.sync.tournamentId = selected.id;
+          state.sync.tournamentName = selected.name;
+        }
+      }
+      if (el.dataset.input === 'project-id') state.sync.projectId = el.value.trim() || 'beau-games';
       if (el.dataset.input === 'sync-url') state.sync.databaseUrl = el.value.trim();
       if (el.dataset.input === 'sync-key') state.sync.tournamentKey = el.value.trim();
       saveStateSoon();
@@ -679,13 +781,45 @@ function bindEvents() {
   const playerSearch = document.getElementById('playerSearch');
   if (playerSearch) playerSearch.oninput = () => renderPlayerSearch(playerSearch.value);
 
+  const playersText = document.getElementById('playersText');
+  if (playersText) {
+    playersText.oninput = () => {
+      state.playersText = playersText.value;
+      updateSetupPlayerCount();
+      saveStateSoon();
+    };
+  }
+
   const importText = document.getElementById('importText');
   const importBtn = document.getElementById('importBtn');
   if (importBtn && importText) importBtn.onclick = () => importSnapshotText(importText.value);
 }
 
+function toggleBracketRound(round) {
+  if (!round) return;
+  state.ui = state.ui || { collapsedRounds: {} };
+  state.ui.collapsedRounds = state.ui.collapsedRounds || {};
+  if (state.ui.collapsedRounds[round]) {
+    Object.keys(state.ui.collapsedRounds).forEach((key) => {
+      if (Number(key) >= round) delete state.ui.collapsedRounds[key];
+    });
+  } else {
+    state.ui.collapsedRounds[round] = true;
+  }
+  commit();
+}
+
+function updateSetupPlayerCount() {
+  const countEl = document.getElementById('playerCountBadge');
+  const textEl = document.getElementById('playersText');
+  if (!countEl || !textEl) return;
+  const count = C.parsePlayers(textEl.value).length;
+  countEl.textContent = `Current: ${count}`;
+}
+
 function renderSetup() {
   const s = state.settings;
+  const playerCount = C.parsePlayers(state.playersText).length;
   return `
     ${state.settings.testMode ? '<div class="alert warn"><strong>TEST MODE ACTIVE.</strong> Timers and the tournament clock can run faster than real time. Turn this off for the real retreat.</div>' : ''}
     <section class="card">
@@ -693,6 +827,9 @@ function renderSetup() {
       <p class="help">Enter players in signup order. First name listed is Seed #1. Highest seeds receive byes when needed.</p>
       <div class="grid two">
         <div>
+          <label for="tournamentName">Tournament name</label>
+          <input id="tournamentName" data-input="tournament-name" value="${escapeAttr(state.sync.tournamentName || '')}" placeholder="Men's Retreat 2026" />
+          <p class="help">Firestore document: <span class="kbd">${escapeHtml(state.sync.tournamentId || tournamentIdFromName(state.sync.tournamentName))}</span></p>
           <label for="playersText">Players, one per line</label>
           <textarea id="playersText">${escapeHtml(state.playersText)}</textarea>
           <div class="button-row" style="margin-top: 10px;">
@@ -701,6 +838,7 @@ function renderSetup() {
             <button class="ghost" data-action="fake-players" data-count="24">Load 24</button>
             <button class="ghost" data-action="fake-players" data-count="30">Load 30</button>
           </div>
+          <p class="help player-count-line"><span id="playerCountBadge" class="badge muted">Current: ${playerCount}</span></p>
         </div>
         <div class="grid">
           <div class="grid two">
@@ -792,6 +930,7 @@ function renderControl() {
   if (!state.matches.length) return emptyState();
   updateSessionFromClock();
   const active = activeMatches();
+  const activePace = active.map(matchPaceInfo);
   const ready = C.orderedReadyMatches(state.matches, state.currentSessionId);
   const onDeck = ready.slice(0, Math.max(1, freeTables().length || 1));
   const later = ready.slice(onDeck.length);
@@ -803,11 +942,13 @@ function renderControl() {
       <div class="section-title">
         <h2>Control Board</h2>
         <div class="button-row">
+          <button class="secondary" data-action="push">Update Database</button>
           <button class="ghost" data-action="undo">Undo Last Result</button>
           <button class="ghost" data-action="reset-tournament">Reset</button>
         </div>
       </div>
       ${renderTables()}
+      ${renderControlPaceSummary(activePace)}
     </section>
     <section class="card">
       <div class="section-title"><h2>Currently Playing / Warming Up</h2><span class="badge muted">${active.length} active</span></div>
@@ -825,6 +966,27 @@ function renderControl() {
   `;
 }
 
+function renderControlPaceSummary(paceItems) {
+  if (!paceItems.length) return '<p class="help">No active games right now. Pace will appear here once a warmup or game starts.</p>';
+  const worst = paceItems.reduce((max, item) => Math.max(max, item.behindMin), 0);
+  const best = paceItems.reduce((min, item) => Math.min(min, item.behindMin), 0);
+  let label = 'On pace';
+  let cls = 'good';
+  if (worst >= 3) {
+    label = `${Math.round(worst)}m behind`;
+    cls = 'warn';
+  } else if (best <= -3) {
+    label = `${Math.abs(Math.round(best))}m ahead`;
+    cls = 'good';
+  }
+  return `
+    <div class="pace-summary">
+      <span class="badge ${cls}" data-pace-summary-label>${label}</span>
+      <span class="muted-text" data-pace-summary-text>${paceItems.length} active table${paceItems.length === 1 ? '' : 's'} tracked against expected match length.</span>
+    </div>
+  `;
+}
+
 function renderTables() {
   const activeByTable = new Map(activeMatches().map((m) => [Number(m.tableId), m]));
   return `<div class="table-list">${(state.tables || []).map((t) => {
@@ -835,6 +997,7 @@ function renderTables() {
 
 function renderActiveMatch(m) {
   const isWarmup = m.status === 'warming';
+  const pace = matchPaceInfo(m);
   return `
     <div class="match-card active" data-match-id="${m.id}">
       <div class="match-title">
@@ -843,9 +1006,17 @@ function renderActiveMatch(m) {
           <div class="players">${playerName(m.playerAId)} vs ${playerName(m.playerBId)}</div>
           <div class="meta">${m.roundName} • First to ${m.points} • ${isWarmup ? 'Warming up' : 'Game in progress'}</div>
         </div>
-        <span class="badge ${isWarmup ? 'warn' : 'good'}">${isWarmup ? 'Warmup' : 'Playing'}</span>
+        <div class="match-badges">
+          <span class="badge muted">${escapeHtml(m.roundName)}</span>
+          <span class="badge ${isWarmup ? 'warn' : 'good'}">${isWarmup ? 'Warmup' : 'Playing'}</span>
+        </div>
       </div>
       <div class="timer" data-timer="${isWarmup ? 'warmup' : 'game'}" data-id="${m.id}">--:--</div>
+      <div class="active-pace-row" data-pace-id="${m.id}">
+        <span data-pace-expected>Expected ${pace.expectedLabel}</span>
+        <span data-pace-finish>Projected finish ${C.formatClock(pace.projectedEndMs)}</span>
+        <span class="badge ${pace.badgeClass}" data-pace-status>${escapeHtml(pace.statusLabel)}</span>
+      </div>
       <div class="button-row" style="margin-top: 12px;">
         ${isWarmup ? `<button class="good" data-action="start-game" data-id="${m.id}">Start Game</button>` : ''}
         ${m.status === 'playing' ? `<button class="good" data-action="finish" data-id="${m.id}" data-winner="${m.playerAId}">${escapeHtml(playerName(m.playerAId))} Won</button><button class="good" data-action="finish" data-id="${m.id}" data-winner="${m.playerBId}">${escapeHtml(playerName(m.playerBId))} Won</button>` : ''}
@@ -853,6 +1024,35 @@ function renderActiveMatch(m) {
       </div>
     </div>
   `;
+}
+
+function matchPaceInfo(match) {
+  const isWarmup = match.status === 'warming';
+  const settings = state.settings || {};
+  const warmupMin = Number(match.warmupDurationMin || settings.standardWarmupMin || 2);
+  const expectedTotalMin = C.occupancyMinutesForMatch(match, settings, warmupMin);
+  const expectedGameMin = C.gameMinutesForPoints(match.points, settings);
+  const start = isWarmup ? Number(match.warmupStartedAt || nowMs()) : Number(match.gameStartedAt || nowMs());
+  const elapsedMin = Math.max(0, (nowMs() - start) / C.MINUTE);
+  const expectedForCurrentState = isWarmup ? expectedTotalMin : expectedGameMin;
+  const remainingMin = Math.max(0, expectedForCurrentState - elapsedMin);
+  const behindMin = elapsedMin - expectedForCurrentState;
+  let statusLabel = 'On pace';
+  let badgeClass = 'good';
+  if (behindMin >= 1) {
+    statusLabel = `${Math.round(behindMin)}m over`;
+    badgeClass = behindMin >= 3 ? 'warn' : 'muted';
+  } else if (behindMin <= -1) {
+    statusLabel = `${Math.round(Math.abs(behindMin))}m left`;
+    badgeClass = 'good';
+  }
+  return {
+    expectedLabel: isWarmup ? C.formatDuration(expectedTotalMin) : C.formatDuration(expectedGameMin),
+    projectedEndMs: nowMs() + remainingMin * C.MINUTE,
+    behindMin,
+    statusLabel,
+    badgeClass,
+  };
 }
 
 function renderReadyMatch(m, onDeck) {
@@ -867,7 +1067,10 @@ function renderReadyMatch(m, onDeck) {
           <div class="players">${playerName(m.playerAId)} vs ${playerName(m.playerBId)}</div>
           <div class="meta">${m.roundName} • First to ${m.points} • Est. ${est ? C.formatClock(est.estimatedStartMs) : 'soon'}</div>
         </div>
-        <span class="badge ${safetyClass}">${safety.level.toUpperCase()}</span>
+        <div class="match-badges">
+          <span class="badge muted">${escapeHtml(m.roundName)}</span>
+          <span class="badge ${safetyClass}">${safety.level.toUpperCase()}</span>
+        </div>
       </div>
       <p class="help">${escapeHtml(safety.message)}</p>
       <div class="button-row">
@@ -887,6 +1090,7 @@ function renderHeldMatch(m) {
     <div class="match-card">
       <h3>Match ${m.displayId}</h3>
       <div class="players">${playerName(m.playerAId)} vs ${playerName(m.playerBId)}</div>
+      <p><span class="badge muted">${escapeHtml(m.roundName)}</span></p>
       <p class="help">Held for ${session?.label || m.holdUntilSession}.</p>
       <button class="secondary" data-action="prioritize" data-id="${m.id}">Release / Prioritize</button>
     </div>
@@ -905,7 +1109,10 @@ function renderOverview() {
     <section class="card">
       <div class="section-title">
         <h2>Tournament Overview</h2>
-        <span class="badge ${champion ? 'good' : 'muted'}">${champion ? `Champion: ${escapeHtml(playerName(champion))}` : 'In Progress'}</span>
+        <div class="button-row">
+          <button class="secondary" data-action="pull">Retrieve Database</button>
+          <span class="badge ${champion ? 'good' : 'muted'}">${champion ? `Champion: ${escapeHtml(playerName(champion))}` : 'In Progress'}</span>
+        </div>
       </div>
       <div class="grid two">
         <div>
@@ -988,41 +1195,163 @@ function renderPlayerSearch(term) {
 function renderBracket() {
   if (!state.matches.length) return emptyState();
   const rounds = [...new Set(state.matches.map((m) => m.round))];
-  const estimates = bracketSchedule();
-  const totalRows = Math.pow(2, rounds.length);
+  const estimates = tournamentEstimateMap();
+  const collapsed = state.ui?.collapsedRounds || {};
+  const firstOpenRound = rounds.find((round) => !collapsed[round]) || rounds[rounds.length - 1];
+  const lastRound = rounds[rounds.length - 1];
+  const layout = buildBracketVisualLayout(rounds, firstOpenRound);
   return `
     <section class="card">
-      <h2>Bracket</h2>
-      <p class="help">Byes are auto-advanced. Seed numbers come directly from signup order. Estimated times are approximate and update as matches finish.</p>
+      <div class="section-title">
+        <h2>Bracket</h2>
+        <button class="secondary" data-action="pull">Retrieve Database</button>
+      </div>
+      <p class="help">Collapse the earliest round to pull later rounds together. Estimated times are approximate and update as matches finish.</p>
       <div class="bracket-rounds">
         ${rounds.map((round) => {
-          const ms = state.matches.filter((m) => m.round === round);
-          return `<div class="bracket-round" style="--bracket-rows: ${totalRows};"><h3>${ms[0]?.roundName || `Round ${round}`}</h3>${ms.map((m) => renderBracketMatch(m, estimates)).join('')}</div>`;
+          const ms = visibleBracketMatches(round);
+          const allRoundMatches = state.matches.filter((m) => m.round === round);
+          const byeMatches = round === 1 ? allRoundMatches.filter((m) => m.isBye) : [];
+          const isCollapsed = !!collapsed[round];
+          const canExpand = isCollapsed;
+          const canCollapse = !isCollapsed && round === firstOpenRound && round !== lastRound;
+          return `
+            <div class="bracket-round ${isCollapsed ? 'collapsed' : ''}" style="--bracket-rows: ${layout.totalRows};">
+              ${renderBracketRoundHeader(round, allRoundMatches[0]?.roundName || `Round ${round}`, isCollapsed, allRoundMatches, canExpand || canCollapse)}
+              ${ms.map((m) => renderBracketMatch(m, estimates, isCollapsed, layout)).join('')}
+              ${byeMatches.length ? renderByeSummary(byeMatches, isCollapsed, layout.totalRows) : ''}
+            </div>
+          `;
         }).join('')}
       </div>
     </section>
   `;
 }
 
-function renderBracketMatch(m, estimates) {
-  const rowStart = (m.roundIndex * Math.pow(2, m.round)) + Math.pow(2, m.round - 1) + 1;
+function visibleBracketMatches(round) {
+  return state.matches.filter((m) => m.round === round && !(round === 1 && m.isBye));
+}
+
+function buildBracketVisualLayout(rounds, firstOpenRound) {
+  const rowStarts = new Map();
+  const visibleByRound = new Map(rounds.map((round) => [round, visibleBracketMatches(round)]));
+  let maxRow = 2;
+
+  rounds.forEach((round) => {
+    if (round < firstOpenRound) return;
+    const matches = visibleByRound.get(round) || [];
+    const previousVisible = visibleByRound.get(round - 1) || [];
+    matches.forEach((match, idx) => {
+      let rowStart;
+      if (round === firstOpenRound) {
+        rowStart = (idx * 2) + 2;
+      } else {
+        const feederRows = [match.slotA, match.slotB]
+          .map((slot) => {
+            if (slot.kind !== 'winner') return null;
+            const source = getMatch(slot.sourceMatchId);
+            if (!source || (source.round === 1 && source.isBye)) return null;
+            return rowStarts.get(source.id) || null;
+          })
+          .filter((row) => row != null);
+
+        const sourceMatches = [match.slotA, match.slotB]
+          .filter((slot) => slot.kind === 'winner')
+          .map((slot) => getMatch(slot.sourceMatchId))
+          .filter(Boolean);
+        const hasHiddenByeFeeder = sourceMatches.some((source) => source.round === 1 && source.isBye);
+
+        if (feederRows.length === 1 && hasHiddenByeFeeder) {
+          rowStart = feederRows[0];
+        } else if (feederRows.length === 2) {
+          rowStart = Math.round((feederRows[0] + feederRows[1]) / 2);
+        } else {
+          const visibleScale = Math.max(1, previousVisible.length / Math.max(1, matches.length));
+          rowStart = Math.round((idx * visibleScale * 2) + visibleScale + 1);
+        }
+      }
+      const previousMatch = matches[idx - 1];
+      const previousRow = previousMatch ? rowStarts.get(previousMatch.id) : null;
+      if (previousRow != null && rowStart < previousRow + 2) rowStart = previousRow + 2;
+      rowStarts.set(match.id, rowStart);
+      maxRow = Math.max(maxRow, rowStart + 2);
+    });
+  });
+
+  return {
+    rowStarts,
+    totalRows: Math.max(maxRow + 2, visibleBracketMatches(firstOpenRound).length * 2 + 2, 4),
+  };
+}
+
+function renderBracketRoundHeader(round, label, isCollapsed, matches, showToggle) {
+  const activeCount = matches.filter((m) => ['warming', 'playing'].includes(m.status)).length;
+  const completeCount = matches.filter((m) => m.status === 'complete' && !m.isBye).length;
+  return `
+    <div class="bracket-round-header">
+      <h3>${escapeHtml(label)}</h3>
+      ${showToggle ? `<button class="ghost bracket-collapse-btn" data-action="toggle-round" data-round="${round}" aria-label="${isCollapsed ? 'Expand' : 'Collapse'} ${escapeAttr(label)}">
+        <span>${isCollapsed ? '>' : 'v'}</span>
+      </button>` : '<span class="bracket-collapse-spacer"></span>'}
+      <div class="bracket-round-summary">
+        <span class="badge muted">${matches.length}</span>
+        ${activeCount ? `<span class="badge good">${activeCount} live</span>` : ''}
+        ${completeCount ? `<span class="badge muted">${completeCount} done</span>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function renderBracketMatch(m, estimates, isCollapsed = false, layout = null) {
+  const rowStart = layout?.rowStarts?.get(m.id) || 2;
   const estimate = estimates.get(m.id);
   const isActive = ['warming', 'playing'].includes(m.status);
-  const statusBadge = isActive
-    ? `<span class="badge good">${m.status === 'warming' ? 'Warming' : 'Playing'}</span>`
-    : m.status === 'complete' && !m.isBye
-      ? '<span class="badge good">Done</span>'
-      : '';
+  const detailLabel = bracketMatchDetailLabel(estimate, m);
+  if (isCollapsed) {
+    return `
+      <div class="bracket-match compact ${isActive ? 'active' : ''}">
+        <strong>M${m.displayId}</strong>
+        <span>${escapeHtml(detailLabel)}</span>
+      </div>
+    `;
+  }
   return `
     <div class="bracket-match ${isActive ? 'active' : ''}" style="grid-row: ${rowStart} / span 2;">
       <div class="bracket-match-head">
         <strong>Match ${m.displayId}</strong>
         <span class="badge muted">First to ${m.points}</span>
       </div>
-      <div class="bracket-estimate">${escapeHtml(formatEstimateLabel(estimate, m))}</div>
-      <div class="bracket-status-row">${m.isBye ? '<span class="badge good">Bye</span>' : ''}${statusBadge}</div>
-      ${renderBracketPlayer(m.playerAId, m.winnerId)}
-      ${renderBracketPlayer(m.playerBId, m.winnerId)}
+      <div class="bracket-estimate ${isActive ? 'active-status' : ''}">${escapeHtml(detailLabel)}</div>
+      ${renderBracketPlayer(m, 'A')}
+      ${renderBracketPlayer(m, 'B')}
+    </div>
+  `;
+}
+
+function bracketMatchDetailLabel(estimate, match) {
+  if (match.status === 'warming') return `Warming Table ${match.tableId || estimate?.tableId || '?'}`;
+  if (match.status === 'playing') return `Playing Table ${match.tableId || estimate?.tableId || '?'}`;
+  if (match.status === 'complete') return match.isBye ? 'BYE' : 'Done';
+  return formatEstimateLabel(estimate, match);
+}
+
+function renderByeSummary(byeMatches, isCollapsed, totalRows) {
+  const names = byeMatches
+    .map((m) => playerName(m.winnerId || m.playerAId || m.playerBId))
+    .filter(Boolean);
+  if (!names.length) return '';
+  if (isCollapsed) {
+    return `
+      <div class="bracket-bye-summary compact">
+        <strong>Byes</strong>
+        <span>${names.length}</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="bracket-bye-summary" style="grid-row: ${totalRows + 2} / span 2;">
+      <strong>First-round byes</strong>
+      <div>${names.map((name) => `<span>${escapeHtml(name)}</span>`).join('')}</div>
     </div>
   `;
 }
@@ -1044,10 +1373,34 @@ function formatEstimateLabel(estimate, match) {
   return `EST ${session?.label || date.toLocaleDateString([], { weekday: 'short' })} ${time}`;
 }
 
-function renderBracketPlayer(id, winnerId) {
+function renderBracketPlayer(matchOrId, slotNameOrWinnerId) {
+  if (typeof matchOrId === 'object') {
+    const match = matchOrId;
+    const slotName = slotNameOrWinnerId;
+    const id = slotName === 'A' ? match.playerAId : match.playerBId;
+    const slot = slotName === 'A' ? match.slotA : match.slotB;
+    return renderBracketPlayerSlot(id, match.winnerId, slot);
+  }
+  return renderBracketPlayerSlot(matchOrId, slotNameOrWinnerId, null);
+}
+
+function renderBracketPlayerSlot(id, winnerId, slot) {
   const player = state.players.find((p) => p.id === id);
-  if (!player) return `<div class="bracket-player tbd"><span>TBD</span></div>`;
+  if (!player) {
+    const label = slot?.kind === 'winner' ? `Winner of Match ${sourceMatchDisplayId(slot.sourceMatchId)}` : 'TBD';
+    return `<div class="bracket-player tbd"><span>${escapeHtml(label)}</span></div>`;
+  }
   return `<div class="bracket-player ${winnerId === id ? 'winner' : ''}"><span>${escapeHtml(player.name)}</span><span>#${player.seed}</span></div>`;
+}
+
+function sourceMatchDisplayId(matchId) {
+  return getMatch(matchId)?.displayId || '?';
+}
+
+function renderTournamentOptions() {
+  const tournaments = state.sync.availableTournaments || [];
+  if (!tournaments.length) return '<option value="">Refresh list to choose a tournament</option>';
+  return tournaments.map((t) => `<option value="${escapeAttr(t.id)}" ${t.id === state.sync.tournamentId ? 'selected' : ''}>${escapeHtml(t.name)}${t.updatedAt ? ` - ${new Date(t.updatedAt).toLocaleString()}` : ''}</option>`).join('');
 }
 
 function renderSyncQa() {
@@ -1063,17 +1416,33 @@ function renderSyncQa() {
       </select>
     </section>
     <section class="card">
-      <h2>Manual Firebase Sync</h2>
-      <p class="help">Optional. The app works without internet. Firebase is only for manual push/refresh snapshots.</p>
+      <h2>Firestore Tournament Sync</h2>
+      <p class="help">Optional manual sync. Master uses Update Database; helper devices choose this tournament and use Retrieve Database.</p>
       <div class="grid two">
-        <div><label>Firebase Realtime Database URL</label><input data-input="sync-url" value="${escapeAttr(state.sync.databaseUrl)}" placeholder="https://your-project-default-rtdb.firebaseio.com" /></div>
-        <div><label>Tournament key</label><input data-input="sync-key" value="${escapeAttr(state.sync.tournamentKey)}" /></div>
+        <div>
+          <label>Current tournament</label>
+          <input data-input="tournament-name" value="${escapeAttr(state.sync.tournamentName || '')}" />
+          <p class="help">Firestore path: <span class="kbd">tournaments/${escapeHtml(state.sync.tournamentId || tournamentIdFromName(state.sync.tournamentName))}</span></p>
+        </div>
+        <div>
+          <label>Load existing tournament</label>
+          <select data-input="tournament-select">${renderTournamentOptions()}</select>
+          <p class="help">Last list refresh: ${state.sync.lastListedAt ? C.formatClock(state.sync.lastListedAt) : 'never'}</p>
+        </div>
       </div>
       <div class="button-row" style="margin-top: 12px;">
-        <button data-action="push">Push Snapshot</button>
-        <button class="secondary" data-action="pull">Refresh From Firebase</button>
+        <button data-action="list-tournaments">Refresh Tournament List</button>
+        <button class="secondary" data-action="pull">Retrieve Database</button>
+        <button class="secondary" data-action="push">Update Database</button>
+        <button class="bad" data-action="delete-tournament">Delete From Firestore</button>
       </div>
       <p class="help">Last pushed: ${state.sync.lastPushedAt ? C.formatClock(state.sync.lastPushedAt) : 'never'} • Last refreshed: ${state.sync.lastPulledAt ? C.formatClock(state.sync.lastPulledAt) : 'never'}</p>
+      <details>
+        <summary>Advanced Firebase details</summary>
+        <p class="help">Project ID is fixed for this app. Keep this only in case you need to troubleshoot later.</p>
+        <label>Firebase project ID</label>
+        <input data-input="project-id" value="${escapeAttr(state.sync.projectId || 'beau-games')}" />
+      </details>
       ${state.sync.lastError ? `<div class="alert bad">${escapeHtml(state.sync.lastError)}</div>` : ''}
     </section>
     <section class="card">
@@ -1132,6 +1501,43 @@ function updateVisibleTimers() {
   });
 }
 
+function updateVisiblePace() {
+  const paceItems = [];
+  document.querySelectorAll('[data-pace-id]').forEach((row) => {
+    const match = getMatch(row.dataset.paceId);
+    if (!match) return;
+    const pace = matchPaceInfo(match);
+    paceItems.push(pace);
+    const expected = row.querySelector('[data-pace-expected]');
+    const finish = row.querySelector('[data-pace-finish]');
+    const status = row.querySelector('[data-pace-status]');
+    if (expected) expected.textContent = `Expected ${pace.expectedLabel}`;
+    if (finish) finish.textContent = `Projected finish ${C.formatClock(pace.projectedEndMs)}`;
+    if (status) {
+      status.textContent = pace.statusLabel;
+      status.className = `badge ${pace.badgeClass}`;
+    }
+  });
+
+  const summaryLabel = document.querySelector('[data-pace-summary-label]');
+  const summaryText = document.querySelector('[data-pace-summary-text]');
+  if (!summaryLabel || !summaryText || !paceItems.length) return;
+  const worst = paceItems.reduce((max, item) => Math.max(max, item.behindMin), 0);
+  const best = paceItems.reduce((min, item) => Math.min(min, item.behindMin), 0);
+  let label = 'On pace';
+  let cls = 'good';
+  if (worst >= 3) {
+    label = `${Math.round(worst)}m behind`;
+    cls = 'warn';
+  } else if (best <= -3) {
+    label = `${Math.abs(Math.round(best))}m ahead`;
+    cls = 'good';
+  }
+  summaryLabel.textContent = label;
+  summaryLabel.className = `badge ${cls}`;
+  summaryText.textContent = `${paceItems.length} active table${paceItems.length === 1 ? '' : 's'} tracked against expected match length.`;
+}
+
 function mmss(ms) {
   const totalSec = Math.floor(ms / 1000);
   const min = Math.floor(totalSec / 60);
@@ -1159,9 +1565,4 @@ window.addEventListener('beforeunload', () => {
 render();
 renderTimer = setInterval(() => {
   tickClock();
-  // Re-render occasionally in running mode so estimates, sessions, and clock-dependent warnings stay fresh.
-  if (state.mode === 'running') {
-    const sec = Math.floor(Date.now() / 1000);
-    if (sec % 10 === 0) render();
-  }
 }, 1000);
