@@ -587,7 +587,7 @@ async function pushSnapshot() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(firestoreTournamentFields(name, payload.state)),
     });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw new Error(await firestoreErrorMessage(res, `update tournaments/${state.sync.tournamentId}`));
     state.sync.lastPushedAt = Date.now();
     state.sync.lastError = '';
     commit('Tournament snapshot pushed to Firestore.');
@@ -603,8 +603,16 @@ async function pullSnapshot() {
     return;
   }
   try {
+    const selected = document.querySelector('[data-input="tournament-select"]');
+    if (selected?.value) {
+      const selectedTournament = (state.sync.availableTournaments || []).find((t) => t.id === selected.value);
+      if (selectedTournament) {
+        state.sync.tournamentId = selectedTournament.id;
+        state.sync.tournamentName = selectedTournament.name;
+      }
+    }
     const res = await fetch(firestoreTournamentUrl());
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw new Error(await firestoreErrorMessage(res, `retrieve tournaments/${state.sync.tournamentId}`));
     const doc = await res.json();
     const rawState = readFirestoreStringField(doc, 'state');
     if (!rawState) throw new Error('No snapshot state found for that tournament.');
@@ -623,7 +631,7 @@ async function pullSnapshot() {
 async function listFirestoreTournaments() {
   try {
     const res = await fetch(`${firestoreBaseUrl()}/tournaments?pageSize=100`);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw new Error(await firestoreErrorMessage(res, 'list tournaments'));
     const payload = await res.json();
     state.sync.availableTournaments = (payload.documents || [])
       .map((doc) => ({
@@ -632,6 +640,10 @@ async function listFirestoreTournaments() {
         updatedAt: readFirestoreTimestampField(doc, 'updatedAt'),
       }))
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    if (state.sync.availableTournaments.length && !state.sync.availableTournaments.some((t) => t.id === state.sync.tournamentId)) {
+      state.sync.tournamentId = state.sync.availableTournaments[0].id;
+      state.sync.tournamentName = state.sync.availableTournaments[0].name;
+    }
     state.sync.lastListedAt = Date.now();
     state.sync.lastError = '';
     commit('Tournament list refreshed.');
@@ -649,7 +661,7 @@ async function deleteFirestoreTournament() {
   if (!confirm(`Delete tournament "${state.sync.tournamentName || state.sync.tournamentId}" from Firestore? Local data on this device will stay.`)) return;
   try {
     const res = await fetch(firestoreTournamentUrl(), { method: 'DELETE' });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw new Error(await firestoreErrorMessage(res, `delete tournaments/${state.sync.tournamentId}`));
     state.sync.availableTournaments = (state.sync.availableTournaments || []).filter((t) => t.id !== state.sync.tournamentId);
     state.sync.lastError = '';
     commit('Tournament deleted from Firestore.');
@@ -657,6 +669,19 @@ async function deleteFirestoreTournament() {
     state.sync.lastError = String(err.message || err);
     commit('Firestore delete failed. Your Firestore rules may still have delete disabled.');
   }
+}
+
+async function firestoreErrorMessage(res, action) {
+  let detail = '';
+  try {
+    const payload = await res.json();
+    detail = payload?.error?.message || JSON.stringify(payload);
+  } catch {
+    try { detail = await res.text(); } catch {}
+  }
+  const project = state.sync.projectId || 'beau-games';
+  const tournament = state.sync.tournamentId || '(none selected)';
+  return `Firestore ${action} failed (${res.status} ${res.statusText || ''}). Project: ${project}. Tournament: ${tournament}.${detail ? ` Details: ${detail}` : ''}`;
 }
 
 function exportSnapshotObject() {
