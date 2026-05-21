@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "tournaments": {
+      "$tournamentKey": {
+        ".read": true,
+        ".write": true
+      }
+    }
+  }
+}

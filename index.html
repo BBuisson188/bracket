@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Retreat Ping-Pong Tournament Control</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>Retreat Ping-Pong Tournament</h1>
+      <p id="headerSubtitle">Offline-first tournament control board</p>
+    </div>
+    <div class="header-status">
+      <span id="modeBadge" class="badge">Setup</span>
+      <span id="clockBadge" class="badge muted">--:--</span>
+    </div>
+  </header>
+
+  <main id="app" class="app-shell"></main>
+
+  <nav class="bottom-nav" aria-label="Main navigation">
+    <button data-tab="setup">Setup</button>
+    <button data-tab="control">Control</button>
+    <button data-tab="overview">Overview</button>
+    <button data-tab="bracket">Bracket</button>
+    <button data-tab="sync">Sync / QA</button>
+  </nav>
+
+  <template id="emptyStateTemplate">
+    <section class="card empty-state">
+      <h2>No tournament loaded</h2>
+      <p>Go to Setup, enter players, choose a tournament option, and start the tournament.</p>
+    </section>
+  </template>
+
+  <script src="core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
