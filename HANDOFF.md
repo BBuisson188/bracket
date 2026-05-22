@@ -56,13 +56,15 @@ These are the user's explicit/strong preferences:
 
 ### Files
 
-- `index.html` - static app shell and bottom navigation
+- `index.html` - static app shell, bottom navigation, app icon/manifest links
 - `styles.css` - CSS for mobile/tablet-friendly cards and controls
 - `core.js` - pure logic helpers, no DOM dependency
 - `app.js` - state management, rendering, timers, event handlers, optional sync
 - `README.md` - simple user/developer overview
 - `QA_CHECKLIST.md` - manual QA checklist for Beau before the retreat
-- `firebase-rules-example.json` - basic demo Realtime Database rules
+- `firebase-rules-example.json` - old/basic demo Realtime Database rules; app now uses Firestore, so do not treat this as current production guidance
+- `site.webmanifest` - web app manifest for install/home-screen behavior
+- `assets/` - favicon, Apple touch icons, and web app icons
 - `tests/core-smoke-test.js` - Node smoke test for bracket logic
 
 ### No framework
@@ -88,7 +90,8 @@ The state object contains:
 - bracket matches
 - table state
 - clock/test mode state
-- Firebase settings
+- Firestore sync settings
+- UI-only state such as collapsed bracket rounds
 - event history
 
 ### Authoritative master model
@@ -159,7 +162,19 @@ Current options:
 
 Each option assigns round formats as 11, 15, or 21 points.
 
-The recommendation prioritizes finishing early. It may recommend Balanced or Relaxed only when timing estimates leave enough room.
+The options are now generated from the configured player count, table count, Friday/Saturday windows, buffers, warmup, transition, and game duration assumptions. They are not fixed templates anymore.
+
+Important current rules:
+
+- Every match in a given round uses the same point target.
+- Later rounds must never be shorter than earlier rounds.
+- The championship/final is always first to 21.
+- Semifinals are always at least first to 15.
+- Fast / Safest aims close to 3 hours without going over.
+- Balanced aims around 3 hours to 3 hours 10 minutes when the schedule allows.
+- Relaxed aims close to the full usable schedule window.
+
+The generator searches possible monotonic round-format combinations and chooses the closest safe fit for each option. This was added because the fixed templates were too conservative for some realistic setups.
 
 This is intentionally recommendation-based, not fully automatic irreversible scheduling.
 
@@ -201,6 +216,34 @@ Unsafe means projected finish is likely after the hard session end. The app reco
 
 The app should warn, not forcibly prevent the organizer from overriding. There is a Start Anyway button.
 
+### Estimated schedule behavior
+
+Estimated match times are shared across Control, Overview, Bracket, and player search. Avoid creating separate estimators for separate screens.
+
+Current estimate behavior:
+
+- Before the configured Friday session starts, future estimates begin at Friday start time, not at the current device time.
+- During an active session, active games use the current device/test clock.
+- Future queued matches are assigned to the next available table.
+- Matches are rolled to the next configured session if they would cross the soft cutoff.
+- The soft cutoff is calculated from session end minus the end buffer.
+- Estimates are directional and useful for planning, but still intentionally approximate.
+
+The Control screen also shows active-match pace information:
+
+- expected duration
+- projected finish
+- whether the game is on pace, has minutes left, or is over estimate
+
+### Rendering / refresh behavior
+
+Do not restore the old full-page periodic render loop. The app used to call `render()` every few seconds while running, but that caused setup textareas and bracket horizontal scroll to jump back to the top/left.
+
+Current behavior:
+
+- `tickClock()` updates the header clock, timers, and active pace text in place.
+- Full `render()` should happen only after explicit state changes, navigation, imports/pulls, or button actions.
+
 ### Match states
 
 Important match statuses:
@@ -213,6 +256,23 @@ Important match statuses:
 - `complete` - winner selected
 
 Byes are represented as completed matches with `isBye: true`.
+
+### Bracket view behavior
+
+The bracket view is operational, not a perfect printed tournament-tree renderer.
+
+Current visual behavior:
+
+- Rounds display as horizontally scrollable columns.
+- Earlier rounds can be progressively collapsed.
+- Only the earliest open round can be collapsed next.
+- Collapsing an earlier round pulls later visible rounds upward/together.
+- First-round byes are hidden as fake match cards and shown in a separate byes summary block.
+- Future unresolved slots display labels such as `Winner of Match 17` instead of plain `TBD`.
+- Active matches are highlighted.
+- The visual layout tries to account for hidden bye feeders without allowing same-round cards to overlap.
+
+Because bye-heavy brackets can get visually complicated, any future bracket changes should be tested with several player counts, especially 10, 19, 21, 24, 26, and 30 players, plus both expanded and collapsed rounds on desktop and iPad/phone widths.
 
 ### Warmup and game flow
 
@@ -276,19 +336,68 @@ Firebase sync is manual snapshot sync.
 
 It does not use realtime listeners.
 It does not use Firebase SDK.
-It uses Realtime Database REST endpoints.
+It uses Cloud Firestore REST endpoints in Beau's existing Firebase project:
+
+```text
+beau-games
+```
+
+The app is still fully offline-first. Firestore is only an optional transport for manual snapshots.
 
 ### Push behavior
 
-Master device pushes the whole app snapshot with HTTP PUT to:
+Master device pushes the whole app snapshot with a Firestore REST PATCH to:
 
 ```text
-<databaseUrl>/tournaments/<tournamentKey>.json
+projects/beau-games/databases/(default)/documents/tournaments/{tournamentId}
 ```
+
+The Firestore document contains:
+
+- `name`
+- `updatedAt`
+- `state`
+
+The `state` field is a JSON string containing the full local app state. This keeps Firestore REST handling simple and avoids converting every nested tournament field into Firestore typed-value objects.
+
+The main master workflow is the **Update Database** button on the Control screen.
 
 ### Refresh behavior
 
-Viewer/helper device fetches the same URL and replaces local state with the snapshot.
+Viewer/helper device fetches the selected Firestore tournament document and replaces local state with the snapshot.
+
+The main helper workflow:
+
+1. Go to Sync / QA.
+2. Click Refresh Tournament List.
+3. Choose the tournament from the dropdown.
+4. Click Retrieve Database.
+5. Use Overview or Bracket.
+6. Click Retrieve Database again when the helper needs a fresh snapshot.
+
+Overview and Bracket also include a Retrieve Database button.
+
+### Tournament naming
+
+Setup includes a Tournament name field. The app converts that name into a Firestore document id, for example:
+
+```text
+Men's Retreat 2026 -> mens-retreat-2026
+```
+
+There is not yet a robust preflight duplicate-name validator. Firestore update currently overwrites the same document id. This is acceptable for the intended one-master workflow but should be improved if multiple simultaneous test tournaments are common.
+
+### Delete behavior
+
+The UI includes Delete From Firestore for cleanup during testing. This will only work if Firestore rules allow deletes for `tournaments/{tournamentId}`.
+
+The user's previously confirmed rules had:
+
+```js
+allow delete: if false;
+```
+
+With those rules, the delete button is expected to fail with a clear Firestore error. This is safer for the event. Temporarily enabling delete may be convenient during testing.
 
 ### Why this design
 
@@ -296,7 +405,7 @@ The venue internet may be unreliable. The tournament must work without internet.
 
 ### Security note
 
-The included `firebase-rules-example.json` has public read/write rules for simplicity. That is acceptable only for a low-stakes temporary event database with a non-obvious tournament key. For production use, add authentication and stricter rules.
+The current Firestore approach has no Firebase Auth/login. Rules are intentionally permissive enough for a low-stakes temporary event. This is not a production security model.
 
 ## Known limitations / areas for Codex improvement
 
@@ -307,8 +416,9 @@ This is a complete first packaged build, but these are the areas most worth chec
    - Make sure bottom tabs are easy to tap.
 
 2. **Bracket visual density**
-   - The bracket is currently a horizontal scroll list by round, not a drawn bracket tree.
-   - Operationally this is fine, but a prettier bracket could be added.
+   - The bracket is a horizontally scrollable operational bracket with progressive round collapse.
+   - Bye-heavy layouts are the highest-risk visual area.
+   - Test collapsed and expanded states with common player counts before changing layout math.
 
 3. **Viewer role enforcement**
    - The UI disables Setup and Control tabs in viewer mode.
@@ -330,10 +440,34 @@ This is a complete first packaged build, but these are the areas most worth chec
 7. **Estimated start times**
    - Estimates are directional, not precise.
    - This is intentional. Human behavior is the dominant variable.
+   - Estimates should be shared across screens through the same estimate source.
 
-8. **Firebase REST configuration**
-   - Requires a Realtime Database URL, not a Firestore URL.
-   - Make this clearer in any future UI copy if needed.
+8. **Firestore sync**
+   - Uses Firestore REST in project `beau-games`, collection `tournaments`.
+   - Manual push/pull only.
+   - No realtime listeners.
+   - No Firebase SDK.
+   - No Firebase Auth.
+   - Delete depends on Firestore rules.
+
+9. **GitHub publishing**
+   - Beau usually tests on the published GitHub Pages version from phone/iPad.
+   - After code changes, provide a normal PowerShell copy/paste block:
+
+```powershell
+cd "C:\Users\bbuis\Local Docs\Codex\ping_pong_tourn"
+
+git add .
+git commit -m "Short useful message"
+git push
+```
+
+   - This environment often cannot write to `.git`, so Beau may need to run publish commands manually.
+
+10. **App icons**
+   - `index.html` references favicon, PNG favicons, Apple touch icons, and `site.webmanifest`.
+   - Kept icon files are in `assets/`.
+   - Old generated extras were intentionally removed/marked for deletion previously.
 
 ## QA instructions for Codex
 
@@ -366,7 +500,7 @@ Avoid telling him something is guaranteed. Use wording like:
 
 - “This has been packaged and smoke-tested.”
 - “The important next step is to run through the QA checklist on the actual device you plan to use.”
-- “The app is designed to work offline, but Firebase sync depends on internet access and Realtime Database configuration.”
+- "The app is designed to work offline, but Firestore sync depends on internet access and the configured Firebase project/rules."
 
 ## Current build status
 
@@ -374,5 +508,8 @@ Avoid telling him something is guaranteed. Use wording like:
 - Core JavaScript syntax checked with Node.
 - App JavaScript syntax checked with Node.
 - Core smoke test passed for player counts 2 through 32.
-- Zip package should include all project files.
-
+- Firestore manual sync has been implemented and tested at least once by Beau.
+- Tournament options now use adaptive monotonic round formats.
+- Bracket view has progressive collapse, hidden bye summary, active highlights, and winner-of-match placeholders.
+- App icons and web manifest have been added.
+- Core smoke test passed for player counts 2 through 32.

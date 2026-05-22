@@ -61,6 +61,45 @@ const roomyOptions = C.generateTournamentOptions(makePlayers(19), roomySettings)
 const roomyRelaxed = roomyOptions.find((o) => o.id === 'relaxed');
 assert(Object.values(roomyRelaxed.formats).every((points) => points === 21), 'Roomy 19-player relaxed option should allow all 21-point rounds.');
 
+const crowdedOptions = C.generateTournamentOptions(makePlayers(29), settings);
+const crowdedFast = crowdedOptions.find((o) => o.id === 'fast');
+assert(Object.values(crowdedFast.formats).every((points) => points === 11), '29-player fast option should use 11-point games through the championship.');
+
+for (let n = 4; n <= 17; n += 1) {
+  const players = makePlayers(n);
+  const options = C.generateTournamentOptions(players, { ...settings, allowDoubleElimination: true });
+  const option = options.find((o) => o.id === 'double-elimination');
+  assert(option, `Expected a double-elimination option for ${n} players.`);
+  assert(option.estimate.counts.total === (n * 2) - 1, `Double-elimination estimate should include possible reset for ${n} players.`);
+  const bracket = C.buildBracket(players, option);
+  let guard = 0;
+  while (!bracket.find((m) => m.roundName === 'Championship' && m.status === 'complete') && guard < 300) {
+    guard += 1;
+    const ready = C.orderedReadyMatches(bracket, 'friday');
+    assert(ready.length > 0, `No ready double-elimination match while simulating ${n} players at step ${guard}`);
+    const m = ready[0];
+    C.completeMatch(bracket, m.id, m.playerAId);
+  }
+  const championship = bracket.find((m) => m.roundName === 'Championship');
+  assert(championship && championship.status === 'complete' && championship.winnerId, `Double-elimination tournament did not complete for ${n}`);
+}
+
+const doubleEightOption = C.generateTournamentOptions(makePlayers(8), { ...settings, allowDoubleElimination: true }).find((o) => o.id === 'double-elimination');
+const doubleEightBracket = C.buildBracket(makePlayers(8), doubleEightOption);
+let firstReady = C.orderedReadyMatches(doubleEightBracket, 'friday')[0];
+C.completeMatch(doubleEightBracket, firstReady.id, firstReady.playerAId);
+firstReady = C.orderedReadyMatches(doubleEightBracket, 'friday')[0];
+C.completeMatch(doubleEightBracket, firstReady.id, firstReady.playerAId);
+assert(C.orderedReadyMatches(doubleEightBracket, 'friday')[0].bracketName === 'Winners Bracket', 'Double elimination should not immediately schedule fresh losers when other first-round winners matches are ready.');
+while (doubleEightBracket.filter((m) => m.bracketName === 'Winners Bracket' && m.round === 1 && m.status === 'complete').length < 4) {
+  firstReady = C.orderedReadyMatches(doubleEightBracket, 'friday')[0];
+  C.completeMatch(doubleEightBracket, firstReady.id, firstReady.playerAId);
+}
+assert(C.orderedReadyMatches(doubleEightBracket, 'friday')[0].bracketName === 'Losers Bracket', 'Double elimination should mix in losers bracket matches once rested and ready.');
+
+const tooManyForDouble = C.generateTournamentOptions(makePlayers(18), { ...settings, allowDoubleElimination: true });
+assert(!tooManyForDouble.some((o) => o.id === 'double-elimination'), 'Double elimination should not be generated above 17 players.');
+
 for (let n = 2; n <= 32; n += 1) {
   const players = makePlayers(n);
   const option = C.generateTournamentOptions(players, settings)[0];

@@ -112,9 +112,11 @@
     return formats;
   }
 
-  function generateFormatCandidates(totalRounds) {
+  function generateFormatCandidates(totalRounds, rules = {}) {
     const candidates = [];
     const pointChoices = [11, 15, 21];
+    const minFinalPoints = rules.allowShortFinal ? 11 : 21;
+    const minSemifinalPoints = rules.allowShortSemifinal ? 11 : 15;
 
     function build(round, formats) {
       if (round > totalRounds) {
@@ -123,8 +125,8 @@
       }
       pointChoices.forEach((points) => {
         if (round > 1 && points < formats[round - 1]) return;
-        if (round === totalRounds && points < 21) return;
-        if (round === totalRounds - 1 && points < 15) return;
+        if (round === totalRounds && points < minFinalPoints) return;
+        if (round === totalRounds - 1 && points < minSemifinalPoints) return;
         formats[round] = points;
         build(round + 1, formats);
       });
@@ -134,8 +136,14 @@
     return candidates.sort((a, b) => formatScore(a) - formatScore(b));
   }
 
-  function chooseSmartFormats(playerCount, tableCount, totalRounds, settings, targetMinutes, maxMinutes) {
-    const candidates = generateFormatCandidates(totalRounds);
+  function allRoundsFormat(totalRounds, points) {
+    const formats = {};
+    for (let r = 1; r <= totalRounds; r += 1) formats[r] = points;
+    return formats;
+  }
+
+  function chooseSmartFormats(playerCount, tableCount, totalRounds, settings, targetMinutes, maxMinutes, rules = {}) {
+    const candidates = generateFormatCandidates(totalRounds, rules);
     let best = candidates[0];
     let bestDistance = Infinity;
     candidates.forEach((formats) => {
@@ -185,7 +193,19 @@
     return sessionMinutes(settings).reduce((sum, session) => sum + session.effectiveMinutes, 0);
   }
 
-  function optionMatchCounts(playersCount, totalRounds, roundFormats) {
+  function doubleEliminationMatchCounts(playersCount, roundFormats) {
+    const total = Math.max(0, (playersCount * 2) - 1);
+    const championshipRound = Math.max(...Object.keys(roundFormats || { 1: 11 }).map(Number));
+    const counts = { total, 11: 0, 15: 0, 21: 0 };
+    const finalPoints = roundFormats?.[championshipRound] || 11;
+    const earlyPoints = roundFormats?.[1] || 11;
+    counts[earlyPoints] = Math.max(0, total - 1);
+    counts[finalPoints] = (counts[finalPoints] || 0) + (total > 0 ? 1 : 0);
+    return counts;
+  }
+
+  function optionMatchCounts(playersCount, totalRounds, roundFormats, tournamentFormat = 'single-elimination') {
+    if (tournamentFormat === 'double-elimination') return doubleEliminationMatchCounts(playersCount, roundFormats);
     const counts = { total: Math.max(0, playersCount - 1), 11: 0, 15: 0, 21: 0 };
     const size = nextPowerOfTwo(playersCount);
     for (let r = 1; r <= totalRounds; r += 1) {
@@ -202,10 +222,10 @@
     return counts;
   }
 
-  function estimateOption(playersCount, tableCount, roundFormats, settings = {}) {
+  function estimateOption(playersCount, tableCount, roundFormats, settings = {}, tournamentFormat = 'single-elimination') {
     const size = nextPowerOfTwo(playersCount);
     const totalRounds = Math.log2(size);
-    const counts = optionMatchCounts(playersCount, totalRounds, roundFormats);
+    const counts = optionMatchCounts(playersCount, totalRounds, roundFormats, tournamentFormat);
     let tableMinutes = 0;
     [11, 15, 21].forEach((points) => {
       tableMinutes += (counts[points] || 0) * occupancyMinutesForMatch(points, settings);
@@ -238,40 +258,68 @@
     const fastMax = Math.min(180, available * 0.9);
     const balancedMax = Math.min(190, available * 0.95);
     const relaxedMax = available;
-    const fastFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, fastMax, fastMax);
-    const balancedFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, Math.min(185, balancedMax), balancedMax);
+    const fastFormats = playerCount > 28
+      ? allRoundsFormat(totalRounds, 11)
+      : chooseSmartFormats(playerCount, tableCount, totalRounds, settings, fastMax, fastMax);
+    const balancedFormats = chooseSmartFormats(
+      playerCount,
+      tableCount,
+      totalRounds,
+      settings,
+      Math.min(185, balancedMax),
+      balancedMax,
+      { allowShortSemifinal: playerCount > 28 }
+    );
     const relaxedFormats = chooseSmartFormats(playerCount, tableCount, totalRounds, settings, available, relaxedMax);
     const rawOptions = [
       {
         id: 'fast',
         name: 'Fast / Safest',
         description: 'Protects the schedule first. Uses the longest game formats that still leave a large time cushion.',
+        tournamentFormat: 'single-elimination',
         formats: fastFormats,
       },
       {
         id: 'balanced',
         name: 'Balanced',
         description: 'Middle option. Adds longer games when the player count, tables, and session windows make room.',
+        tournamentFormat: 'single-elimination',
         formats: balancedFormats,
       },
       {
         id: 'relaxed',
         name: 'Relaxed',
         description: 'Most generous safe option. Can become all 21-point games when the schedule clearly allows it.',
+        tournamentFormat: 'single-elimination',
         formats: relaxedFormats,
       },
     ];
 
+    if (settings.allowDoubleElimination && playerCount >= 4 && playerCount <= 17) {
+      const doubleRounds = Math.max(1, (Math.log2(size) * 2) - 1);
+      const doubleFormats = allRoundsFormat(doubleRounds, 11);
+      rawOptions[2] = {
+        id: 'double-elimination',
+        name: 'Double Elimination',
+        description: 'Everyone gets a second life. Uses 11-point games throughout, with a second 11-point final if the losers bracket winner takes the championship.',
+        tournamentFormat: 'double-elimination',
+        formats: doubleFormats,
+      };
+    }
+
     const estimated = rawOptions.map((option) => ({
       ...option,
-      estimate: estimateOption(playerCount, tableCount, option.formats, settings),
+      estimate: estimateOption(playerCount, tableCount, option.formats, settings, option.tournamentFormat),
     }));
 
     // Recommend the most enjoyable option that still protects the schedule.
     let recommendedId = 'fast';
     const relaxed = estimated.find((o) => o.id === 'relaxed');
     const balanced = estimated.find((o) => o.id === 'balanced');
-    if (relaxed && relaxed.estimate.pressure !== 'risky' && relaxed.estimate.realisticMinutes <= relaxed.estimate.availableMinutes * 0.82) {
+    const doubleElimination = estimated.find((o) => o.id === 'double-elimination');
+    if (doubleElimination && doubleElimination.estimate.pressure !== 'risky') {
+      recommendedId = 'double-elimination';
+    } else if (relaxed && relaxed.estimate.pressure !== 'risky' && relaxed.estimate.realisticMinutes <= relaxed.estimate.availableMinutes * 0.82) {
       recommendedId = 'relaxed';
     } else if (balanced && balanced.estimate.pressure !== 'risky' && balanced.estimate.realisticMinutes <= balanced.estimate.availableMinutes * 0.72) {
       recommendedId = 'balanced';
@@ -284,6 +332,8 @@
   }
 
   function buildBracket(players, option) {
+    if (option?.tournamentFormat === 'double-elimination') return buildDoubleEliminationBracket(players, option);
+
     const safePlayers = players.map((p, idx) => ({ ...p, seed: idx + 1, id: p.id || `p${idx + 1}` }));
     const size = nextPowerOfTwo(safePlayers.length);
     const totalRounds = Math.log2(size);
@@ -363,6 +413,147 @@
     return matches;
   }
 
+  function makeMatch(matchCounter, attrs) {
+    return {
+      id: `m${matchCounter}`,
+      displayId: matchCounter,
+      status: 'waiting',
+      tableId: null,
+      winnerId: null,
+      loserId: null,
+      nextMatchId: null,
+      nextSlot: null,
+      priority: 0,
+      holdUntilSession: null,
+      createdAt: Date.now(),
+      ...attrs,
+    };
+  }
+
+  function buildDoubleEliminationBracket(players, option) {
+    const safePlayers = players.map((p, idx) => ({ ...p, seed: idx + 1, id: p.id || `p${idx + 1}` }));
+    const size = nextPowerOfTwo(safePlayers.length);
+    const totalWinnerRounds = Math.log2(size);
+    const order = seedOrder(size);
+    const bySeed = new Map(safePlayers.map((p) => [p.seed, p]));
+    const matches = [];
+    let matchCounter = 1;
+    let stage = 1;
+    let previousWinnerRound = [];
+    const makeStageName = (label) => label;
+
+    for (let i = 0; i < size; i += 2) {
+      const seedA = order[i];
+      const seedB = order[i + 1];
+      const playerA = bySeed.get(seedA) || null;
+      const playerB = bySeed.get(seedB) || null;
+      const match = makeMatch(matchCounter++, {
+        round: stage,
+        bracketName: 'Winners Bracket',
+        roundName: makeStageName(`Winners ${roundName(1, totalWinnerRounds)}`),
+        roundIndex: i / 2,
+        points: option.formats?.[stage] || 11,
+        slotA: { kind: 'seed', seed: seedA, playerId: playerA?.id || null },
+        slotB: { kind: 'seed', seed: seedB, playerId: playerB?.id || null },
+        playerAId: playerA?.id || null,
+        playerBId: playerB?.id || null,
+      });
+      matches.push(match);
+      previousWinnerRound.push(match);
+    }
+
+    const winnerRounds = [previousWinnerRound];
+    for (let wbRound = 2; wbRound <= totalWinnerRounds; wbRound += 1) {
+      stage += 1;
+      const nextWinnerRound = [];
+      for (let i = 0; i < previousWinnerRound.length; i += 2) {
+        const prevA = previousWinnerRound[i];
+        const prevB = previousWinnerRound[i + 1];
+        const match = makeMatch(matchCounter++, {
+          round: stage,
+          bracketName: 'Winners Bracket',
+          roundName: makeStageName(`Winners ${roundName(wbRound, totalWinnerRounds)}`),
+          roundIndex: i / 2,
+          points: option.formats?.[stage] || 11,
+          slotA: { kind: 'winner', sourceMatchId: prevA.id, playerId: null },
+          slotB: { kind: 'winner', sourceMatchId: prevB.id, playerId: null },
+          playerAId: null,
+          playerBId: null,
+        });
+        prevA.nextMatchId = match.id;
+        prevA.nextSlot = 'A';
+        prevB.nextMatchId = match.id;
+        prevB.nextSlot = 'B';
+        matches.push(match);
+        nextWinnerRound.push(match);
+      }
+      winnerRounds.push(nextWinnerRound);
+      previousWinnerRound = nextWinnerRound;
+    }
+
+    let loserPool = [];
+    let loserRoundNumber = 1;
+    const makeLoserRound = (slots, targetCount = null) => {
+      if (slots.length <= 1) return slots;
+      stage += 1;
+      const out = [];
+      for (let i = 0; i < slots.length; i += 2) {
+        const slotA = slots[i];
+        const slotB = slots[i + 1] || null;
+        if (!slotB) {
+          out.push(slotA);
+          continue;
+        }
+        const match = makeMatch(matchCounter++, {
+          round: stage,
+          bracketName: 'Losers Bracket',
+          roundName: `Losers Round ${loserRoundNumber}`,
+          roundIndex: i / 2,
+          points: option.formats?.[stage] || 11,
+          slotA: { ...slotA, playerId: null },
+          slotB: { ...slotB, playerId: null },
+          playerAId: null,
+          playerBId: null,
+        });
+        matches.push(match);
+        out.push({ kind: 'winner', sourceMatchId: match.id, playerId: null });
+      }
+      loserRoundNumber += 1;
+      if (targetCount && out.length > targetCount) return makeLoserRound(out, targetCount);
+      return out;
+    };
+
+    winnerRounds.forEach((wbMatches, idx) => {
+      const entrants = wbMatches.map((m) => ({ kind: 'loser', sourceMatchId: m.id, playerId: null }));
+      loserPool = makeLoserRound([...loserPool, ...entrants]);
+      const nextEntrantCount = winnerRounds[idx + 1]?.length || 1;
+      if (idx < winnerRounds.length - 1 && loserPool.length > nextEntrantCount) {
+        loserPool = makeLoserRound(loserPool, nextEntrantCount);
+      }
+    });
+
+    stage += 1;
+    const winnersFinal = winnerRounds[winnerRounds.length - 1][0];
+    const losersChampionSlot = loserPool[0] || { kind: 'loser', sourceMatchId: winnersFinal.id, playerId: null };
+    const championship = makeMatch(matchCounter++, {
+      round: stage,
+      bracketName: 'Championship',
+      roundName: 'Championship',
+      roundIndex: 0,
+      points: 11,
+      note: 'If the losers bracket winner wins, play one additional 11-point deciding game.',
+      slotA: { kind: 'winner', sourceMatchId: winnersFinal.id, playerId: null },
+      slotB: { ...losersChampionSlot, playerId: null },
+      playerAId: null,
+      playerBId: null,
+      priority: 20,
+    });
+    matches.push(championship);
+
+    propagateWinners(matches);
+    return matches;
+  }
+
   function cloneMatches(matches) {
     return JSON.parse(JSON.stringify(matches));
   }
@@ -378,12 +569,13 @@
       matches.forEach((match) => {
         ['A', 'B'].forEach((slotName) => {
           const slot = slotName === 'A' ? match.slotA : match.slotB;
-          if (slot.kind === 'winner') {
+          if (slot.kind === 'winner' || slot.kind === 'loser') {
             const prev = byId.get(slot.sourceMatchId);
-            if (prev?.winnerId && slot.playerId !== prev.winnerId) {
-              slot.playerId = prev.winnerId;
-              if (slotName === 'A') match.playerAId = prev.winnerId;
-              else match.playerBId = prev.winnerId;
+            const resolvedId = slot.kind === 'winner' ? prev?.winnerId : prev?.loserId;
+            if (resolvedId && slot.playerId !== resolvedId) {
+              slot.playerId = resolvedId;
+              if (slotName === 'A') match.playerAId = resolvedId;
+              else match.playerBId = resolvedId;
               changed = true;
             }
           }
@@ -394,17 +586,25 @@
           const b = match.playerBId;
           const slotAIsRealBye = match.slotA.kind === 'seed' && !match.slotA.playerId;
           const slotBIsRealBye = match.slotB.kind === 'seed' && !match.slotB.playerId;
+          const slotAResolvedEmpty = slotResolvedEmpty(match.slotA, byId);
+          const slotBResolvedEmpty = slotResolvedEmpty(match.slotB, byId);
 
           // Only auto-advance true first-round byes.
           // Do NOT auto-advance future-round matches just because one prior match has finished
           // and the other prior match is still waiting. That was the most important bracket edge case.
-          if (a && !b && slotBIsRealBye) {
+          if (!a && !b && slotAResolvedEmpty && slotBResolvedEmpty) {
+            match.status = 'complete';
+            match.winnerId = null;
+            match.loserId = null;
+            match.isBye = true;
+            changed = true;
+          } else if (a && !b && (slotBIsRealBye || slotBResolvedEmpty)) {
             match.status = 'complete';
             match.winnerId = a;
             match.loserId = null;
             match.isBye = true;
             changed = true;
-          } else if (!a && b && slotAIsRealBye) {
+          } else if (!a && b && (slotAIsRealBye || slotAResolvedEmpty)) {
             match.status = 'complete';
             match.winnerId = b;
             match.loserId = null;
@@ -418,6 +618,15 @@
       });
     }
     return matches;
+  }
+
+  function slotResolvedEmpty(slot, byId) {
+    if (!slot || slot.kind === 'seed') return false;
+    const source = byId.get(slot.sourceMatchId);
+    if (!source || source.status !== 'complete') return false;
+    if (slot.kind === 'winner') return !source.winnerId;
+    if (slot.kind === 'loser') return !source.loserId;
+    return false;
   }
 
   function findPlayer(players, id) {
@@ -440,26 +649,100 @@
     match.loserId = winnerId === match.playerAId ? match.playerBId : match.playerAId;
     match.tableId = null;
     match.completedAt = Date.now();
+    match.completedSeq = nextCompletedSeq(matches);
     match.isBye = false;
     propagateWinners(matches);
     return matches;
   }
 
   function orderedReadyMatches(matches, currentSessionId = 'friday') {
-    return matches
+    const ready = matches
       .filter((m) => {
         if (!(m.playerAId && m.playerBId)) return false;
         if (['complete', 'playing', 'warming'].includes(m.status)) return false;
         if (m.holdUntilSession && m.holdUntilSession !== currentSessionId) return false;
         return true;
-      })
-      .sort((a, b) => {
-        const pa = Number(a.priority || 0);
-        const pb = Number(b.priority || 0);
-        if (pa !== pb) return pb - pa;
-        if (a.round !== b.round) return a.round - b.round;
-        return a.roundIndex - b.roundIndex;
       });
+    if (!matches.some((m) => m.bracketName === 'Losers Bracket' || m.bracketName === 'Championship')) {
+      return ready.sort(sortSingleEliminationReady);
+    }
+    return ready.sort((a, b) => sortDoubleEliminationReady(a, b, matches));
+  }
+
+  function sortSingleEliminationReady(a, b) {
+    const pa = Number(a.priority || 0);
+    const pb = Number(b.priority || 0);
+    if (pa !== pb) return pb - pa;
+    if (a.round !== b.round) return a.round - b.round;
+    return a.roundIndex - b.roundIndex;
+  }
+
+  function nextCompletedSeq(matches) {
+    return matches.reduce((max, m) => Math.max(max, Number(m.completedSeq || 0)), 0) + 1;
+  }
+
+  function completedMatchSeq(match) {
+    return Number(match.completedSeq || 0);
+  }
+
+  function recentPlayedMatches(matches, count = 2) {
+    return matches
+      .filter((m) => m.status === 'complete' && !m.isBye && m.completedAt)
+      .sort((a, b) => completedMatchSeq(b) - completedMatchSeq(a) || Number(b.completedAt || 0) - Number(a.completedAt || 0))
+      .slice(0, count);
+  }
+
+  function sortDoubleEliminationReady(a, b, matches) {
+    const scoreA = doubleEliminationReadyScore(a, matches);
+    const scoreB = doubleEliminationReadyScore(b, matches);
+    if (scoreA !== scoreB) return scoreB - scoreA;
+    if ((a.bracketName || '') !== (b.bracketName || '')) {
+      const bracketRank = { Championship: 3, 'Losers Bracket': 2, 'Winners Bracket': 1 };
+      const ar = bracketRank[a.bracketName] || 0;
+      const br = bracketRank[b.bracketName] || 0;
+      if (ar !== br) return br - ar;
+    }
+    if (a.round !== b.round) return a.round - b.round;
+    return a.roundIndex - b.roundIndex;
+  }
+
+  function doubleEliminationReadyScore(match, matches) {
+    const recent = recentPlayedMatches(matches, 2);
+    const recentByPlayer = new Map();
+    recent.forEach((completed, idx) => {
+      [completed.playerAId, completed.playerBId].filter(Boolean).forEach((playerId) => {
+        if (!recentByPlayer.has(playerId)) recentByPlayer.set(playerId, idx + 1);
+      });
+    });
+
+    let score = Number(match.priority || 0) * 100;
+    if (match.bracketName === 'Championship') score += 500;
+    else if (match.bracketName === 'Losers Bracket') score += 200;
+    else score += 100;
+
+    const playerPenalty = [match.playerAId, match.playerBId].reduce((penalty, playerId) => {
+      const depth = recentByPlayer.get(playerId);
+      if (depth === 1) return Math.max(penalty, 500);
+      if (depth === 2) return Math.max(penalty, 260);
+      return penalty;
+    }, 0);
+    score -= playerPenalty;
+
+    if (match.bracketName === 'Losers Bracket' && loserDropRecentlyPlayed(match, matches, recent)) {
+      score -= 300;
+    }
+
+    return score;
+  }
+
+  function loserDropRecentlyPlayed(match, matches, recent) {
+    const byId = new Map(matches.map((m) => [m.id, m]));
+    const recentIds = new Set(recent.map((m) => m.id));
+    return [match.slotA, match.slotB].some((slot) => {
+      if (slot?.kind !== 'loser') return false;
+      const source = byId.get(slot.sourceMatchId);
+      return source?.bracketName === 'Winners Bracket' && recentIds.has(source.id);
+    });
   }
 
   function parseTimeToMinutes(timeString) {

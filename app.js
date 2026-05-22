@@ -51,6 +51,7 @@ function defaultState() {
       aheadWarmupMin: 4,
       transitionMin: 1,
       gameDurations: { 11: 7, 15: 10, 21: 14 },
+      allowDoubleElimination: true,
       testMode: false,
       timeScale: 10,
     },
@@ -390,6 +391,7 @@ function updateSettingsFromSetupForm() {
     15: Number(get('duration15').value || 10),
     21: Number(get('duration21').value || 14),
   };
+  state.settings.allowDoubleElimination = get('allowDoubleElimination')?.checked ?? true;
   state.settings.testMode = get('testMode').checked;
   state.settings.timeScale = Number(get('timeScale').value || 10);
 }
@@ -451,10 +453,15 @@ function finishMatch(matchId, winnerId) {
   match.loserId = winnerId === match.playerAId ? match.playerBId : match.playerAId;
   match.tableId = null;
   match.completedAt = nowMs();
+  match.completedSeq = nextCompletedSeq();
   match.isBye = false;
   C.propagateWinners(state.matches);
   state.history.push({ at: nowMs(), type: 'complete', matchId, winnerId, message: `${playerName(winnerId)} won Match ${match.displayId}.` });
   commit(`${playerName(winnerId)} won Match ${match.displayId}. Table ${table} is free.`);
+}
+
+function nextCompletedSeq() {
+  return (state.matches || []).reduce((max, m) => Math.max(max, Number(m.completedSeq || 0)), 0) + 1;
 }
 
 function cancelActive(matchId) {
@@ -514,6 +521,7 @@ function undoLastResult() {
   completed.winnerId = null;
   completed.loserId = null;
   completed.completedAt = null;
+  completed.completedSeq = null;
   // Clear downstream matches that depended on this result.
   const clearDownstream = (match) => {
     if (!match.nextMatchId) return;
@@ -654,9 +662,14 @@ async function pullSnapshot() {
     if (!rawState) throw new Error('No snapshot state found for that tournament.');
     const pulledState = JSON.parse(rawState);
     const keepSync = { ...state.sync };
+    const keepLocalDevice = {
+      role: state.role,
+      activeTab: state.activeTab,
+    };
     state = mergeDefaults(defaultState(), pulledState);
+    state.role = keepLocalDevice.role;
+    state.activeTab = keepLocalDevice.activeTab;
     state.sync = { ...state.sync, ...keepSync, lastPulledAt: Date.now(), lastError: '' };
-    if (state.role === 'viewer') state.activeTab = 'overview';
     commit('Tournament snapshot retrieved from Firestore.');
   } catch (err) {
     state.sync.lastError = String(err.message || err);
@@ -939,6 +952,10 @@ function renderSetup() {
             <div><label for="duration21">21-point game min</label><input id="duration21" type="number" min="1" step="0.5" value="${s.gameDurations[21]}" /></div>
             <div><label for="timeScale">Test speed</label><input id="timeScale" type="number" min="1" value="${s.timeScale}" /></div>
           </div>
+          <label class="check-row">
+            <input id="allowDoubleElimination" type="checkbox" ${s.allowDoubleElimination ? 'checked' : ''} />
+            <span>Allow double elimination when 4-17 players are entered</span>
+          </label>
           <div class="button-row">
             <button data-action="generate-options">Generate Tournament Options</button>
             <button class="good" data-action="start-tournament">Start Tournament</button>
@@ -970,12 +987,16 @@ function renderOptionCard(o) {
   const e = o.estimate;
   const selected = o.id === state.selectedOptionId;
   const pressureClass = e.pressure === 'comfortable' ? 'good' : e.pressure === 'tight' ? 'warn' : 'bad';
-  const roundFormats = Object.entries(o.formats).map(([round, points]) => `R${round}: ${points}`).join(' • ');
+  const roundFormats = o.tournamentFormat === 'double-elimination'
+    ? 'All matches: 11'
+    : Object.entries(o.formats).map(([round, points]) => `R${round}: ${points}`).join(' • ');
+  const formatLabel = o.tournamentFormat === 'double-elimination' ? 'Double elimination' : 'Single elimination';
   return `
     <div class="card option-card ${selected ? 'selected' : ''} ${o.recommended ? 'recommended' : ''}" data-action="choose-option" data-id="${o.id}">
       <h3>${escapeHtml(o.name)}</h3>
       <p class="help">${escapeHtml(o.description)}</p>
       <p><span class="badge ${pressureClass}">${e.pressure.toUpperCase()}</span></p>
+      <p><span class="badge muted">${formatLabel}</span></p>
       <div class="stat-row">
         <div class="stat"><strong>${C.formatDuration(e.optimisticMinutes)}–${C.formatDuration(e.realisticMinutes)}</strong><span>estimate range</span></div>
         <div class="stat"><strong>${e.counts.total}</strong><span>played matches</span></div>
@@ -983,6 +1004,7 @@ function renderOptionCard(o) {
         <div class="stat"><strong>${C.formatDuration(e.availableMinutes)}</strong><span>usable time</span></div>
       </div>
       <p class="help">${roundFormats}</p>
+      ${o.tournamentFormat === 'double-elimination' ? '<p class="help">Championship note: if the losers bracket winner wins, play one extra 11-point game.</p>' : ''}
     </div>
   `;
 }
@@ -1268,6 +1290,7 @@ function renderBracket() {
         <button class="secondary" data-action="pull">Retrieve Database</button>
       </div>
       <p class="help">Collapse the earliest round to pull later rounds together. Estimated times are approximate and update as matches finish.</p>
+      ${selectedOption()?.tournamentFormat === 'double-elimination' ? '<p class="help">Double elimination uses winners bracket, losers bracket, and a championship match. If the losers bracket winner wins the championship, play one additional 11-point deciding game.</p>' : ''}
       <div class="bracket-rounds">
         ${rounds.map((round) => {
           const ms = visibleBracketMatches(round);
@@ -1448,7 +1471,11 @@ function renderBracketPlayer(matchOrId, slotNameOrWinnerId) {
 function renderBracketPlayerSlot(id, winnerId, slot) {
   const player = state.players.find((p) => p.id === id);
   if (!player) {
-    const label = slot?.kind === 'winner' ? `Winner of Match ${sourceMatchDisplayId(slot.sourceMatchId)}` : 'TBD';
+    const label = slot?.kind === 'winner'
+      ? `Winner of Match ${sourceMatchDisplayId(slot.sourceMatchId)}`
+      : slot?.kind === 'loser'
+        ? `Loser of Match ${sourceMatchDisplayId(slot.sourceMatchId)}`
+        : 'TBD';
     return `<div class="bracket-player tbd"><span>${escapeHtml(label)}</span></div>`;
   }
   return `<div class="bracket-player ${winnerId === id ? 'winner' : ''}"><span>${escapeHtml(player.name)}</span><span>#${player.seed}</span></div>`;

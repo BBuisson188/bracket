@@ -93,6 +93,20 @@ label {
   margin-bottom: 6px;
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+}
+.check-row input {
+  width: auto;
+  flex: 0 0 auto;
+}
+.check-row span {
+  line-height: 1.25;
+}
+
 .help {
   margin: 6px 0 0;
   color: var(--muted);
